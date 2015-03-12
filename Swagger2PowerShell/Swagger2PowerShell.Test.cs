@@ -14,7 +14,7 @@ namespace Swagger2PowerShell
         [TestMethod]
         public void ShouldDoSomething()
         {
-            var response = Swagger2PowerShell.CreatePowerShellModuleFromSwaggerSpec("http://petstore.swagger.io/v2/swagger.json", "SPS", "C:\\Temp\\");
+            var response = Swagger2PowerShell.CreatePowerShellModuleFromSwaggerSpec("http://webster-dev2014.madvdi.local:1234/api-docs/", "SPS", "C:\\Temp\\");
             Assert.IsTrue(response);
         }
     }
