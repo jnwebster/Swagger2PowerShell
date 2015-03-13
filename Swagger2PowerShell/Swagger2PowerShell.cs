@@ -1,10 +1,12 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -17,9 +19,11 @@ namespace Swagger2PowerShell
         private static List<VerbNounCmdlet> _cmdlets;
         private static Dictionary<string, string> _models;
         private static int _recurseDepth;
+        private static string _baseUri;
 
         static Swagger2PowerShell()
         {
+            _baseUri = "";
             _recurseDepth = 0;
             _cmdlets = new List<VerbNounCmdlet>();
             _models = new Dictionary<string, string>();
@@ -27,6 +31,8 @@ namespace Swagger2PowerShell
 
         public static bool CreatePowerShellModuleFromSwaggerSpec(string swaggerJsonUri, string cmdletPrefix, string psModuleLocation)
         {
+            SetBaseUri(swaggerJsonUri);
+
             // retrieve the swagger json file
             var jsonSpec = GetSwaggerSpec(swaggerJsonUri);
 
@@ -41,6 +47,14 @@ namespace Swagger2PowerShell
                 {
                     return false;
                 }
+            }
+
+            // check and see if there is a base path to add on to the web api uri
+            var basePath = "";
+            if (jsonTree.GetValue("basePath") != null)
+            {
+                basePath = jsonTree.GetValue("basePath").ToString();
+                if (basePath.Equals("/")) basePath = "";
             }
 
             // traverse the apis, building powershell cmdlets off of what is discovered
@@ -60,7 +74,7 @@ namespace Swagger2PowerShell
                 }
                 else
                 {
-                    GenerateCmdletsFromApiJson(api);
+                    GenerateCmdletsFromApiJson(api, basePath);
                 }
             }
 
@@ -77,6 +91,17 @@ namespace Swagger2PowerShell
             }
 
             return true;
+        }
+
+        private static void SetBaseUri(string swaggerUri)
+        {
+            if (_baseUri.Equals(""))
+            {
+                var providedUri = new Uri(swaggerUri);
+
+                // this extracts the protocol://uri:port format
+                _baseUri = string.Format("{0}://{1}:{2}", providedUri.Scheme, providedUri.Host, providedUri.Port);
+            }
         }
 
         private static string GeneratePowerShellCode(string cmdletPrefix)
@@ -125,7 +150,7 @@ namespace Swagger2PowerShell
                 }
                 else
                 {
-                    code += GenerateParamSetCmdletFor(pair.Key, cmdletPrefix);
+                    code += GenerateComplexCmdletFor(pair.Key, cmdletPrefix);
                 }
                 code += @"
 
@@ -135,37 +160,382 @@ namespace Swagger2PowerShell
             return code;
         }
 
-        private static string GenerateParamSetCmdletFor(KeyValuePair<string, string> verbNoun, string cmdletPrefix)
+        private static string GenerateComplexCmdletFor(KeyValuePair<string, string> verbNoun, string cmdletPrefix)
         {
-            string code = "";
+            var cmdletsToBuild = _cmdlets.Where(c => c.Verb.Equals(verbNoun.Key) && c.Noun.Equals(verbNoun.Value)).ToList();
+            var nounWithFirstLetterUppercase = verbNoun.Value.First().ToString(CultureInfo.InvariantCulture).ToUpper() + verbNoun.Value.Substring(1);
+            var code = @"function " + verbNoun.Key + @"-" + cmdletPrefix + nounWithFirstLetterUppercase + @"
+{
+    param(";
+
+            // how many different parameter sets do we have?
+            // if just 1, then we can do optional parameters that take a different endpoint
+            // if > 1, then we can do parameter sets
+            var paramSets = new List<string>();
+            foreach (var cmdlet in cmdletsToBuild)
+            {
+                if (!paramSets.Contains(cmdlet.ParameterSetName))
+                {
+                    paramSets.Add(cmdlet.ParameterSetName);
+                }
+            }
+
+            if (paramSets.Count == 1)
+            {
+                // optional parameter(s)
+                code += GenerateOptionalParameterCmdlet(cmdletsToBuild);
+            }
+            else
+            {
+                // parameter sets
+                code += GenerateParameterSetCmdlet(cmdletsToBuild);
+            }
+
+            code += @"
+        $response
+    }
+}
+";
+            return code;
+        }
+
+        private static string GenerateParameterSetCmdlet(List<VerbNounCmdlet> cmdletsToBuild)
+        {
+            var code = @"";
+
+            // determine which parameters are common to all and which are optional
+            var parameterCounts = CountParameterOccurences(cmdletsToBuild);
+            var commonParameters = GetCommonParameters(parameterCounts, cmdletsToBuild);
+            var optionalParameters = GetOptionalParameters(parameterCounts, cmdletsToBuild);
+
+            var addComma = false;
+            foreach (var commonParam in commonParameters)
+            {
+                // only the body gets its object type
+                // skip the noun entirely
+                if (commonParam.Key == "body")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [" + commonParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (commonParam.Key != "noun")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [object]$" + commonParam.Key;
+                    addComma = true;
+                }
+            }
+            foreach (var optionalParam in optionalParameters)
+            {
+                var thisParamSets = GetThisParamSetFromParam(optionalParam, cmdletsToBuild);
+                // only the body gets its object type
+                // skip the noun entirely (I don't think the noun will ever be optional, but meh)
+                if (optionalParam.Key == "body")
+                {
+                    if (addComma) code += @",";
+                    foreach (var paramSet in thisParamSets)
+                    {
+                        code += @"
+        [Parameter(ParameterSet=" + paramSet + @")]";
+                    }
+                    code += @"
+        [" + optionalParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (optionalParam.Key != "noun")
+                {
+                    if (addComma) code += @",";
+                    foreach (var paramSet in thisParamSets)
+                    {
+                        code += @"
+        [Parameter(ParameterSet=" + paramSet + @")]";
+                    }
+                    code += @"
+        [object]$" + optionalParam.Key;
+                    addComma = true;
+                }
+            }
 
             return code;
+        }
+
+        private static List<string> GetThisParamSetFromParam(KeyValuePair<string, string> parameter, List<VerbNounCmdlet> cmdletsToCheck)
+        {
+            var setsFoundIn = new List<string>();
+            foreach (var cmdlet in cmdletsToCheck)
+            {
+                foreach (var param in cmdlet.ParameterSet)
+                {
+                    if (param.Equals(parameter)) setsFoundIn.Add(cmdlet.ParameterSetName);
+                }
+            }
+            return setsFoundIn;
+        }
+
+        private static string GenerateOptionalParameterCmdlet(List<VerbNounCmdlet> cmdletsToBuild)
+        {
+            var code = @"";
+
+            // determine which parameters are common to all and which are optional
+            var parameterCounts = CountParameterOccurences(cmdletsToBuild);
+            var commonParameters = GetCommonParameters(parameterCounts, cmdletsToBuild);
+            var optionalParameters = GetOptionalParameters(parameterCounts, cmdletsToBuild);
+
+            var addComma = false;
+            foreach (var commonParam in commonParameters)
+            {
+                // only the body gets its object type
+                // skip the noun entirely
+                if (commonParam.Key == "body")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [" + commonParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (commonParam.Key != "noun")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [object]$" + commonParam.Key;
+                    addComma = true;
+                }
+            }
+            foreach (var optionalParam in optionalParameters)
+            {
+                // only the body gets its object type
+                // skip the noun entirely (I don't think the noun will ever be optional, but meh)
+                if (optionalParam.Key == "body")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [" + optionalParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (optionalParam.Key != "noun")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [object]$" + optionalParam.Key;
+                    addComma = true;
+                }
+            }
+
+            // parameters have been added, now begin the body
+            code += @"
+    )
+    Begin
+    {
+        ";
+
+            // now build the if...else if...else statement that determines which endpoint to hit
+            var ifElseInOrder = new string[cmdletsToBuild.Count];
+            var addElse = false;
+            foreach (var cmdlet in cmdletsToBuild)
+            {
+                string thisCmdletCode;
+                var thisCmdletOptionalParams = new List<string>();
+                foreach (var param in cmdlet.ParameterSet)
+                {
+                    if (optionalParameters.Contains(param) && !thisCmdletOptionalParams.Contains(param.Key))
+                    {
+                        thisCmdletOptionalParams.Add(param.Key);
+                    }
+                }
+                if (thisCmdletOptionalParams.Count == 0)
+                {
+                    // this one has no optional statements - it's the default
+                    // that means this will be our final else statement, put it at the end
+                    thisCmdletCode = @"else
+        {
+            ";
+                    thisCmdletCode += CreateInvokeRestMethod(cmdlet);
+                    thisCmdletCode += @"
+        }
+        ";
+                    ifElseInOrder[cmdletsToBuild.Count - 1] = thisCmdletCode;
+                }
+                else
+                {
+                    if (addElse)
+                    {
+                        thisCmdletCode = @"else if (";
+                    }
+                    else
+                    {
+                        thisCmdletCode = @"if (";
+                    }
+                    addElse = true;
+                    var addAnd = false;
+                    foreach (var param in thisCmdletOptionalParams)
+                    {
+                        if (addAnd) thisCmdletCode += @" -and ";
+                        addAnd = true;
+                        thisCmdletCode += @"($($" + param + @") -ne $null";
+                    }
+                    thisCmdletCode += @")
+        {
+            ";
+                    thisCmdletCode += CreateInvokeRestMethod(cmdlet);
+                    thisCmdletCode += @"
+        }
+        ";
+                    var thisSlot = GetNextSlot(ifElseInOrder);
+                    ifElseInOrder[thisSlot] = thisCmdletCode;
+                }
+            }
+
+            // add it all in
+            for (var x = 0; x < cmdletsToBuild.Count; x++)
+            {
+                code += ifElseInOrder[x];
+            }
+
+            return code;
+        }
+
+        private static int GetNextSlot(string[] slots)
+        {
+            for (var x = 0; x < slots.Count(); x++)
+            {
+                if (string.IsNullOrEmpty(slots[x])) return x;
+            }
+            return -1;
+        }
+
+        private static List<KeyValuePair<string, string>> GetOptionalParameters(List<KeyValuePair<string, int>> counts, List<VerbNounCmdlet> cmdletsToCheck)
+        {
+            var countOfCmdlets = cmdletsToCheck.Count;
+            var optionalParameterNames = counts.Where(p => p.Value != countOfCmdlets).Select(p => p.Key).ToList();
+            var optionalParameters = new List<KeyValuePair<string, string>>();
+
+            foreach (var cmdlet in cmdletsToCheck)
+            {
+                foreach (var parameter in cmdlet.ParameterSet)
+                {
+                    if (optionalParameterNames.Contains(parameter.Key) && !optionalParameters.Contains(parameter))
+                    {
+                        optionalParameters.Add(parameter);
+                    }
+                }
+            }
+
+            return optionalParameters;
+        }
+
+        private static List<KeyValuePair<string, string>> GetCommonParameters(List<KeyValuePair<string, int>> counts, List<VerbNounCmdlet> cmdletsToCheck)
+        {
+            var countOfCmdlets = cmdletsToCheck.Count;
+            var commonParameterNames = counts.Where(p => p.Value.Equals(countOfCmdlets)).Select(p => p.Key).ToList();
+            var commonParameters = new List<KeyValuePair<string, string>>();
+
+            foreach (var cmdlet in cmdletsToCheck)
+            {
+                foreach (var parameter in cmdlet.ParameterSet)
+                {
+                    if (commonParameterNames.Contains(parameter.Key) && !commonParameters.Contains(parameter))
+                    {
+                        commonParameters.Add(parameter);
+                    }
+                }
+            }
+
+            return commonParameters;
+        }
+
+        private static List<KeyValuePair<string, int>> CountParameterOccurences(List<VerbNounCmdlet> cmdletsToCheck)
+        {
+            var parameterCounts = new List<KeyValuePair<string, int>>();
+
+            foreach (var cmdlet in cmdletsToCheck)
+            {
+                foreach (var param in cmdlet.ParameterSet)
+                {
+                    // are there any entries in the list that match this yet?
+                    var thisParamExists = parameterCounts.Any(p => p.Key.Equals(param.Key));
+                    if (thisParamExists)
+                    {
+                        // KeyValuePairs are immutable - can't just go and ++ the value
+                        var thisParam = parameterCounts.First(p => p.Key.Equals(param.Key));
+                        var incrementedParam = new KeyValuePair<string, int>(thisParam.Key, thisParam.Value + 1);
+                        parameterCounts.Remove(thisParam);
+                        parameterCounts.Add(incrementedParam);
+                    }
+                    else
+                    {
+                        parameterCounts.Add(new KeyValuePair<string, int>(param.Key, 1));
+                    }
+                }
+            }
+            return parameterCounts;
         }
 
         private static string GenerateSimpleCmdletFor(KeyValuePair<string, string> verbNoun, string cmdletPrefix)
         {
             var cmdletToBuild = _cmdlets.First(c => c.Verb.Equals(verbNoun.Key) && c.Noun.Equals(verbNoun.Value));
-            var code = @"function " + cmdletToBuild.Verb + @"-" + cmdletPrefix + cmdletToBuild.Noun + @"
+            var nounWithFirstLetterUppercase = verbNoun.Value.First().ToString(CultureInfo.InvariantCulture).ToUpper() + verbNoun.Value.Substring(1);
+            var code = @"function " + verbNoun.Key + @"-" + cmdletPrefix + nounWithFirstLetterUppercase + @"
 {
     param(";
             var addComma = false;
             foreach (var param in cmdletToBuild.ParameterSet)
             {
-                if (addComma) code += @",";
-                code += @"
-        [" + param.Value + @"]$" + param.Key;
-                addComma = true;
+                // only the body gets its object type
+                // skip the noun entirely
+                if (param.Key == "body")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [" + param.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (param.Key != "noun")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [Parameter(Mandatory=$true)]
+        [object]$" + param.Key;
+                    addComma = true;
+                }
             }
             code += @"
     )
     Begin
     {
         ";
-            // Invoke-RestMethod -Uri
+
+            code += CreateInvokeRestMethod(cmdletToBuild);
             code += @"
+        $response
     }
 }
 ";
+            return code;
+        }
+
+        private static string CreateInvokeRestMethod(VerbNounCmdlet cmdletToBuild)
+        {
+            // search the endpoint URI for parameter names, replace them with PowerShell escaped variables
+            var requestUri = cmdletToBuild.Endpoint.Replace("{", "$($").Replace("}", ")");
+
+            // get our REST method back, since we got rid of it before
+            var requestMethod = ConvertPowerShellVerbToRestMethod(cmdletToBuild.Verb);
+
+            var code = @"$response = Invoke-RestMethod -Uri """ + requestUri + @""" -Method " + requestMethod + @" -ContentType 'application/json' -Headers @{accept=""Application/JSON""}";
+
+            // determine if the request requires a Body
+            if (cmdletToBuild.ParameterSet.Any(p => p.Key.Equals("body")))
+            {
+                code += @" -Body $($body |  ConvertTo-JSON)";
+            }
             return code;
         }
 
@@ -327,9 +697,9 @@ namespace Swagger2PowerShell
             return retVal;
         }
 
-        private static void GenerateCmdletsFromApiJson(JObject api)
+        private static void GenerateCmdletsFromApiJson(JObject api, string basePath)
         {
-            var endpoint = api.GetValue("path").ToString();
+            var endpoint = basePath + api.GetValue("path").ToString();
             var nounAndParameters = GetNounAndParametersFromEndpoint(endpoint);
 
             // operations is an array containing every method that can be accessed for this endpoint
@@ -337,7 +707,7 @@ namespace Swagger2PowerShell
 
             foreach (JObject operation in operations)
             {
-                ConvertOperationToCmdlet(operation, nounAndParameters, endpoint);
+                ConvertOperationToCmdlet(operation, new List<KeyValuePair<string, string>>(nounAndParameters), endpoint);
             }
 
             // at this point, we have turned all available operations in this api into cmdlets
@@ -345,7 +715,7 @@ namespace Swagger2PowerShell
 
         private static List<KeyValuePair<string, string>> GetNounAndParametersFromEndpoint(string endpoint)
         {
-            var path = endpoint.Split(Convert.ToChar("/"));
+            var path = endpoint.Split('/');
             var nodeCount = path.Count();
 
             // first string = param name, second string = param type
@@ -357,6 +727,7 @@ namespace Swagger2PowerShell
             // the first node is the noun (unless it's {id}, in which case the next one is)
             // every node marked by {...} is a parameter name, with the subsequent node its type
             // if a node is not preceded by {...} then skip it
+            var brackets = new[] {'{', '}'};
             var thisParamName = "";
             var state = PathSearchingState.Beginning;
             for (var x = (nodeCount - 1); x >= 0; x--)
@@ -366,11 +737,11 @@ namespace Swagger2PowerShell
                     if (state == PathSearchingState.Beginning)
                     {
                         // found a parameter first - DON'T CHANGE STATE YET
-                        thisParamName = path[x];
+                        thisParamName = path[x].Trim(brackets);
                     }
                     else if (state == PathSearchingState.LookingForParameterName)
                     {
-                        thisParamName = path[x];
+                        thisParamName = path[x].Trim(brackets);
                         state = PathSearchingState.LookingForParameterType;
                     }
                     // the else would be if we found a {...} but weren't expecting one - two names in a row?
@@ -454,14 +825,20 @@ namespace Swagger2PowerShell
                 var secondParam = allParametersForThisOperation[1];
                 if (secondParam.Value.Equals(noun))
                 {
-                    return "byID";
+                    var paramSetName = (noun + "byID");
+                    // tack on another noun if there is one
+                    if (allParametersForThisOperation.Count > 2)
+                    {
+                        paramSetName = allParametersForThisOperation[2].Value + paramSetName;
+                    }
+                    return paramSetName;
                 }
                 else if (secondParam.Value.Equals("SwitchParam"))
                 {
                     return secondParam.Key;
                 }
             }
-            return "all";
+            return ("all" + noun);
         }
 
         private static List<KeyValuePair<string, string>> GetMethodSpecificParameters(JToken parameters)
@@ -492,6 +869,23 @@ namespace Swagger2PowerShell
                     return "Remove";
                 default:
                     throw new Exception(String.Format("Couldn't translate RESTful method verb [{0}] to a suitable PowerShell verb.", restMethod));
+            }
+        }
+
+        private static string ConvertPowerShellVerbToRestMethod(string psVerb)
+        {
+            switch (psVerb)
+            {
+                case "Get":
+                    return "GET";
+                case "Set":
+                    return "PUT";
+                case "Add":
+                    return "POST";
+                case "Remove":
+                    return "DELETE";
+                default:
+                    throw new Exception(String.Format("Couldn't translate PowerShell verb [{0}] to a suitable RESTful method.", psVerb));
             }
         }
 
