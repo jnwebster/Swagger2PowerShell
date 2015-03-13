@@ -682,7 +682,7 @@ namespace Swagger2PowerShell
             // get our REST method back, since we got rid of it before
             var requestMethod = ConvertPowerShellVerbToRestMethod(cmdletToBuild.Verb);
 
-            var code = @"$response = Invoke-RestMethod -Uri """ + requestUri + @""" -Method " + requestMethod + @" -ContentType 'application/json' -Headers @{accept=""Application/JSON""}";
+            var code = @"$response = Invoke-RestMethod -Uri """ + requestUri + @""" -Method " + requestMethod + @" -ContentType 'application/json' -Headers @{accept=""Application/JSON"";Authorization=""Token"" + $global:AuthToken.Token}";
 
             // determine if the request requires a Body
             if (cmdletToBuild.ParameterSet.Any(p => p.Key.Equals("body")))
