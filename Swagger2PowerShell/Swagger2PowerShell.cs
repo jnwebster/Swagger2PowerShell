@@ -84,6 +84,9 @@ namespace Swagger2PowerShell
             {
                 // all finished - we're ready to turn our list of cmdlet outlines into actual powershell now
                 var powershellCode = GeneratePowerShellCode(cmdletPrefix);
+
+                // save the powershell code to a file
+                System.IO.File.WriteAllText(psModuleLocation, powershellCode);
             }
             else
             {
@@ -241,10 +244,22 @@ namespace Swagger2PowerShell
                     foreach (var paramSet in thisParamSets)
                     {
                         code += @"
-        [Parameter(ParameterSet=" + paramSet + @")]";
+        [Parameter(ParameterSetName='" + paramSet + @"')]";
                     }
                     code += @"
         [" + optionalParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (optionalParam.Value == "SwitchParam")
+                {
+                    if (addComma) code += @",";
+                    foreach (var paramSet in thisParamSets)
+                    {
+                        code += @"
+        [Parameter(ParameterSetName='" + paramSet + @"')]";
+                    }
+                    code += @"
+        [SwitchParameter]$" + optionalParam.Key;
                     addComma = true;
                 }
                 else if (optionalParam.Key != "noun")
@@ -253,12 +268,82 @@ namespace Swagger2PowerShell
                     foreach (var paramSet in thisParamSets)
                     {
                         code += @"
-        [Parameter(ParameterSet=" + paramSet + @")]";
+        [Parameter(ParameterSetName='" + paramSet + @"')]";
                     }
                     code += @"
         [object]$" + optionalParam.Key;
                     addComma = true;
                 }
+            }
+
+            // parameters have been added, now begin the body
+            code += @"
+    )
+    Begin
+    {
+        ";
+
+            // now build the if...else if...else statement that determines which endpoint to hit
+            var ifElseInOrder = new string[cmdletsToBuild.Count];
+            var addElse = false;
+            foreach (var cmdlet in cmdletsToBuild)
+            {
+                string thisCmdletCode;
+                var thisCmdletOptionalParams = new List<string>();
+                foreach (var param in cmdlet.ParameterSet)
+                {
+                    if (optionalParameters.Contains(param) && !thisCmdletOptionalParams.Contains(param.Key))
+                    {
+                        thisCmdletOptionalParams.Add(param.Key);
+                    }
+                }
+                if (thisCmdletOptionalParams.Count == 0)
+                {
+                    // this one has no optional statements - it's the default
+                    // that means this will be our final else statement, put it at the end
+                    thisCmdletCode = @"else
+        {
+            ";
+                    thisCmdletCode += CreateInvokeRestMethod(cmdlet);
+                    thisCmdletCode += @"
+        }
+        ";
+                    ifElseInOrder[cmdletsToBuild.Count - 1] = thisCmdletCode;
+                }
+                else
+                {
+                    if (addElse)
+                    {
+                        thisCmdletCode = @"elseif (";
+                    }
+                    else
+                    {
+                        thisCmdletCode = @"if (";
+                    }
+                    addElse = true;
+                    var addAnd = false;
+                    foreach (var param in thisCmdletOptionalParams)
+                    {
+                        if (addAnd) thisCmdletCode += @" -and ";
+                        addAnd = true;
+                        thisCmdletCode += @"($($" + param + @") -ne $null)";
+                    }
+                    thisCmdletCode += @")
+        {
+            ";
+                    thisCmdletCode += CreateInvokeRestMethod(cmdlet);
+                    thisCmdletCode += @"
+        }
+        ";
+                    var thisSlot = GetNextSlot(ifElseInOrder);
+                    ifElseInOrder[thisSlot] = thisCmdletCode;
+                }
+            }
+
+            // add it all in
+            for (var x = 0; x < cmdletsToBuild.Count; x++)
+            {
+                code += ifElseInOrder[x];
             }
 
             return code;
@@ -271,7 +356,7 @@ namespace Swagger2PowerShell
             {
                 foreach (var param in cmdlet.ParameterSet)
                 {
-                    if (param.Equals(parameter)) setsFoundIn.Add(cmdlet.ParameterSetName);
+                    if (param.Key.Equals(parameter.Key)) setsFoundIn.Add(cmdlet.ParameterSetName);
                 }
             }
             return setsFoundIn;
@@ -317,6 +402,13 @@ namespace Swagger2PowerShell
                     if (addComma) code += @",";
                     code += @"
         [" + optionalParam.Value + @"]$body";
+                    addComma = true;
+                }
+                else if (optionalParam.Value == "SwitchParam")
+                {
+                    if (addComma) code += @",";
+                    code += @"
+        [SwitchParameter]$" + optionalParam.Key;
                     addComma = true;
                 }
                 else if (optionalParam.Key != "noun")
@@ -366,7 +458,7 @@ namespace Swagger2PowerShell
                 {
                     if (addElse)
                     {
-                        thisCmdletCode = @"else if (";
+                        thisCmdletCode = @"elseif (";
                     }
                     else
                     {
@@ -378,7 +470,7 @@ namespace Swagger2PowerShell
                     {
                         if (addAnd) thisCmdletCode += @" -and ";
                         addAnd = true;
-                        thisCmdletCode += @"($($" + param + @") -ne $null";
+                        thisCmdletCode += @"($($" + param + @") -ne $null)";
                     }
                     thisCmdletCode += @")
         {
@@ -420,9 +512,13 @@ namespace Swagger2PowerShell
             {
                 foreach (var parameter in cmdlet.ParameterSet)
                 {
-                    if (optionalParameterNames.Contains(parameter.Key) && !optionalParameters.Contains(parameter))
+                    if (optionalParameterNames.Contains(parameter.Key))                    
                     {
-                        optionalParameters.Add(parameter);
+                        // check if there's already a matching key (but the value doesn't match)
+                        if (!optionalParameters.Any(p => p.Key.Equals(parameter.Key)))
+                        {
+                            optionalParameters.Add(parameter);
+                        }
                     }
                 }
             }
@@ -524,7 +620,9 @@ namespace Swagger2PowerShell
         private static string CreateInvokeRestMethod(VerbNounCmdlet cmdletToBuild)
         {
             // search the endpoint URI for parameter names, replace them with PowerShell escaped variables
-            var requestUri = cmdletToBuild.Endpoint.Replace("{", "$($").Replace("}", ")");
+            var baseUri = new Uri(_baseUri);
+            var endpointUri = cmdletToBuild.Endpoint.Replace("{", "$($").Replace("}", ")");
+            var requestUri = new Uri(baseUri, endpointUri).ToString();
 
             // get our REST method back, since we got rid of it before
             var requestMethod = ConvertPowerShellVerbToRestMethod(cmdletToBuild.Verb);
