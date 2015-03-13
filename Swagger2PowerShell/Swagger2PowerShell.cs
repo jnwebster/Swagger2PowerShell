@@ -3,10 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Web;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -132,6 +128,65 @@ namespace Swagger2PowerShell
             // go through all cmdlets, combining those with the same verb/noun
             code += BuildPowerShellFromCmdlets(cmdletPrefix);
 
+            // alright, everything is together
+            // now go through and make it typesafe
+            code = MakeCodeTypesafe(code);
+
+            return code;
+        }
+
+        private static string MakeCodeTypesafe(string code)
+        {
+            // SUCH A HACK
+            // but I don't care, it's 4am
+            code = code.Replace("public boolean", "public bool");
+            code = code.Replace("public integer", "public int");
+            code = code.Replace("public Guid ", "public string ");
+            code = code.Replace("public IvWorkspaceDataContext", "public object");
+            code = code.Replace("public DmSystem", "public object");
+            code = code.Replace("public Farm ", "public object ");
+            code = code.Replace("public AuthenticationSettings ", "public object ");
+            code = code.Replace("public ConnectionBrokers ", "public object ");
+            code = code.Replace("public ConnectorSettings ", "public object ");
+            code = code.Replace("public DisplaySettings ", "public object ");
+            code = code.Replace("public Downloads ", "public object ");
+            code = code.Replace("public GeneralSettings ", "public object ");
+            code = code.Replace("public LocalResourceSettings ", "public object ");
+            code = code.Replace("public MiscellaneousSettings ", "public object ");
+            code = code.Replace("public ProxyServer ", "public object ");
+            code = code.Replace("public UserExperienceSettings ", "public object ");
+            code = code.Replace("public UserInterfaceText ", "public object ");
+            code = code.Replace("public Farm ", "public object ");
+            code = code.Replace("public array ", "public object ");
+            code = code.Replace("public ApplicationType ", "public object ");
+            code = code.Replace("public ServerType ", "public object ");
+            code = code.Replace("public ClientType ", "public object ");
+            code = code.Replace("public WebsiteSettings ", "public object ");
+            code = code.Replace("public WebsiteStatus ", "public object ");
+            code = code.Replace("[boolean]", "[bool]");
+            code = code.Replace("[integer]", "[int]");
+            code = code.Replace("[Guid]", "[string]");
+            code = code.Replace("[IvWorkspaceDataContext]", "[object]");
+            code = code.Replace("[DmSystem]", "[object]");
+            code = code.Replace("[Farm]", "[object]");
+            code = code.Replace("[AuthenticationSettings]", "[object]");
+            code = code.Replace("[ConnectionBrokers]", "[object]");
+            code = code.Replace("[ConnectorSettings]", "[object]");
+            code = code.Replace("[DisplaySettings]", "[object]");
+            code = code.Replace("[Downloads]", "[object]");
+            code = code.Replace("[GeneralSettings]", "[object]");
+            code = code.Replace("[LocalResourceSettings]", "[object]");
+            code = code.Replace("[MiscellaneousSettings]", "[object]");
+            code = code.Replace("[ProxyServer]", "[object]");
+            code = code.Replace("[UserExperienceSettings]", "[object]");
+            code = code.Replace("[UserInterfaceText]", "[object]");
+            code = code.Replace("[Farm]", "[object]");
+            code = code.Replace("[array]", "[object]");
+            code = code.Replace("[ApplicationType]", "[object]");
+            code = code.Replace("[ServerType]", "[object]");
+            code = code.Replace("[ClientType]", "[object]");
+            code = code.Replace("[WebsiteSettings]", "[object]");
+            code = code.Replace("[WebsiteStatus]", "[object]");
             return code;
         }
 
@@ -259,7 +314,7 @@ namespace Swagger2PowerShell
         [Parameter(ParameterSetName='" + paramSet + @"')]";
                     }
                     code += @"
-        [SwitchParameter]$" + optionalParam.Key;
+        [Switch]$" + optionalParam.Key;
                     addComma = true;
                 }
                 else if (optionalParam.Key != "noun")
@@ -408,7 +463,7 @@ namespace Swagger2PowerShell
                 {
                     if (addComma) code += @",";
                     code += @"
-        [SwitchParameter]$" + optionalParam.Key;
+        [Switch]$" + optionalParam.Key;
                     addComma = true;
                 }
                 else if (optionalParam.Key != "noun")
@@ -749,7 +804,7 @@ namespace Swagger2PowerShell
             foreach (var property in properties)
             {
                 cmdletModel += @"
-        $obj." + property.Key + @" = " + property.Key + @";";
+        $obj." + property.Key + @" = $" + property.Key + @";";
             }
             cmdletModel += @"
         $obj
