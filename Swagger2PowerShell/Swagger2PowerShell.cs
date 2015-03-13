@@ -16,6 +16,12 @@ namespace Swagger2PowerShell
         private static List<VerbNounCmdlet> _cmdlets;
         private static Dictionary<string, string> _models;
 
+        static Swagger2PowerShell()
+        {
+            _cmdlets = new List<VerbNounCmdlet>();
+            _models = new Dictionary<string, string>();
+        }
+
         public static bool CreatePowerShellModuleFromSwaggerSpec(string swaggerJsonUri, string cmdletPrefix, string psModuleLocation)
         {
             // retrieve the swagger json file
@@ -28,7 +34,10 @@ namespace Swagger2PowerShell
             var modelsParent = jsonTree.GetValue("models");
             if (modelsParent != null)
             {
-                BuildModelsFromJson(modelsParent);
+                if (!BuildModelsFromJson(modelsParent, cmdletPrefix))
+                {
+                    return false;
+                }
             }
 
             // traverse the apis, building powershell cmdlets off of what is discovered
@@ -39,7 +48,7 @@ namespace Swagger2PowerShell
             {
                 if (api.Count == 1)
                 {
-                    // recurse into this api
+                    // this api only contains one node: the path to another api - RECURSE!
                     if (!CreatePowerShellModuleFromSwaggerSpec(CombineApiPathWithBasePath(swaggerJsonUri, api.GetValue("path").ToString()), cmdletPrefix, psModuleLocation))
                     {
                         return false;
@@ -54,7 +63,7 @@ namespace Swagger2PowerShell
             return true;
         }
 
-        private static bool BuildModelsFromJson(JToken modelsParent)
+        private static bool BuildModelsFromJson(JToken modelsParent, string cmdletPrefix)
         {
             var models = modelsParent.Children();
             foreach (JProperty model in models)
@@ -90,16 +99,61 @@ namespace Swagger2PowerShell
                             }
                             propertiesList.Add(propertyName, propertyType);
                         }
+                        break;
                     }
                 }
+                GeneratePowerShellObjectFromJson(name, propertiesList, cmdletPrefix);
             }
             return true;
         }
 
-        private static void GeneratePowerShellObject(string objectName, Dictionary<string, string> properties)
+        private static void GeneratePowerShellObjectFromJson(string objectName, Dictionary<string, string> properties, string cmdletPrefix)
         {
             // skip it if it's already there
             if (_models.ContainsKey(objectName)) return;
+
+            // build a C# class that powershell can use based on the json object
+            var objectModel = @"Add-Type -Language CSharp @""
+    public class " + objectName + @"{";
+            foreach (var property in properties)
+            {
+                objectModel += @"
+        public " + property.Value + @" " + property.Key + @";";
+            }
+            objectModel += @"
+    }
+""@
+";
+            _models.Add(objectName, objectModel);
+
+            // okay, we've added the class, now make a helper cmdlet for creating an instance of one
+            var cmdletModel = @"function New-" + cmdletPrefix + objectName + @"
+{
+    param(";
+            var addComma = false;
+            foreach (var property in properties)
+            {
+                if (addComma) cmdletModel += @",";
+                cmdletModel += @"
+        [" + property.Value + @"]$" + property.Key;
+                addComma = true;
+            }
+            cmdletModel += @"
+    )
+    Begin
+    {
+        $obj = New-Object " + objectName + @";";
+            foreach (var property in properties)
+            {
+                cmdletModel += @"
+        $obj." + property.Key + @" = " + property.Key + @";";
+            }
+            cmdletModel += @"
+        $obj
+    }
+}
+";
+            _cmdlets.Add(new VerbNounCmdlet("New", objectName, cmdletModel));
         }
 
         private static void GeneratePowerShellEnumFromJson(JProperty enumProperty, string enumName)
@@ -107,8 +161,8 @@ namespace Swagger2PowerShell
             // skip it if it's already there
             if (_models.ContainsKey(enumName)) return;
 
-            // build a powershell enum based on the json enum
-            var enumModel = @"Add-Type -TypeDefinition @""
+            // build a C# enum that powershell can use based on the json enum
+            var enumModel = @"Add-Type -Language CSharp @""
     public enum " + enumName + @"
     {
         ";
@@ -140,39 +194,107 @@ namespace Swagger2PowerShell
 
         private static void GeneratePowerShellFromApiJson(JObject api, string cmdletPrefix, string psModuleLocation)
         {
+            var nounAndParameters = GetNounAndParametersFromApiPath(api);
+
             // operations is an array containing every method that can be accessed for this endpoint
             var operations = api.GetValue("operations").Children();
 
             foreach (JObject operation in operations)
             {
-                var method = operation.GetValue("method").ToString();
+                ConvertOperationToCmdlet(operation, cmdletPrefix);
             }
             
         }
 
-        private static VerbNounCmdlet ConvertEndpointMethodToVerbNounPair(JProperty endpointMethod)
+        private static Dictionary<string, string> GetNounAndParametersFromApiPath(JObject api)
+        {
+            var path = api.GetValue("path").ToString().Split(Convert.ToChar("/"));
+            var nodeCount = path.Count();
+
+            // first string = param name, second string = param type
+            // noun will always come first
+            var nounAndParameters = new Dictionary<string, string>();
+            
+            // start at the end of the path and work backwards
+            // the first node is the noun (unless it's {id}, in which case the next one is)
+            // every node marked by {...} is a parameter name, with the subsequent node its type
+            // if a node is not preceded by {...} then skip it
+            var thisParamName = "";
+            var state = PathSearchingState.Beginning;
+            for (var x = (nodeCount - 1); x >= 0; x--)
+            {
+                if (path[x].Contains("{") && path[x].Contains("}"))
+                {
+                    if (state == PathSearchingState.Beginning)
+                    {
+                        // found a parameter first - DON'T CHANGE STATE YET
+                        thisParamName = path[x];
+                    }
+                    else if (state == PathSearchingState.LookingForParameterName)
+                    {
+                        thisParamName = path[x];
+                        state = PathSearchingState.LookingForParameterType;
+                    }
+                    // the else would be if we found a {...} but weren't expecting one - two ids in a row?
+                    // skip it, that's too confusing
+                }
+                else
+                {
+                    if (state == PathSearchingState.Beginning)
+                    {
+                        // found the noun
+                        nounAndParameters.Add("noun", path[x]);
+                        state = PathSearchingState.LookingForParameterName;
+                        if (thisParamName != "")
+                        {
+                            // parameter came first, add the parameter now that we know its type (the noun)
+                            nounAndParameters.Add(thisParamName, path[x]);
+                            thisParamName = "";
+                        }
+                    }
+                    else if (state == PathSearchingState.LookingForParameterType)
+                    {
+                        nounAndParameters.Add(thisParamName, path[x]);
+                        thisParamName = "";
+                        state = PathSearchingState.LookingForParameterName;
+                    }
+                }
+            }
+            return nounAndParameters;
+        }
+
+        private static VerbNounCmdlet ConvertOperationToCmdlet(JObject operation, string cmdletPrefix)
         {
             // take a swagger endpoint method and turn it into a verb noun pair
 
-            // the verb is the method (POST/PUT/GET/DELETE/etc)
-            var verb = endpointMethod.Name;
-
-            // the noun is a little trickier
-            var methodProperties = ((JObject)endpointMethod.Value).GetValue("tags");
+            // extract the verb
+            var verb = ConvertRestMethodToPowerShellVerb(operation.GetValue("method").ToString());
 
 
 
             return new VerbNounCmdlet(verb, "");
         }
 
+        private static string ConvertRestMethodToPowerShellVerb(string restMethod)
+        {
+            switch (restMethod)
+            {
+                case "GET":
+                    return "Get";
+                case "PUT":
+                    return "Set";
+                case "POST":
+                    return "Add";
+                case "DELETE":
+                    return "Remove";
+                default:
+                    throw new Exception(String.Format("Couldn't translate RESTful method verb [{0}] to a suitable PowerShell verb.", restMethod));
+            }
+        }
+
         private static bool VerbNourPairAlreadyExists(VerbNounCmdlet needle, List<VerbNounCmdlet> haystack)
         {
             return false;
-        }
-
-        private static VerbNounCmdlet BuildNewCmdletFromSwaggerPath(KeyValuePair<string, JToken> path, string cmdletPrefix)
-        {
-            return new VerbNounCmdlet();
         }
 
         private static JObject DeserializeSwaggerSpec(string jsonSpec)
@@ -206,6 +328,13 @@ namespace Swagger2PowerShell
                 }
             }
         }
+    }
+
+    internal enum PathSearchingState
+    {
+        Beginning,
+        LookingForParameterName,
+        LookingForParameterType
     }
 
     internal class VerbNounCmdlet
